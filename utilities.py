@@ -1,6 +1,7 @@
 import json
 import re
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 from scipy import stats
@@ -8,6 +9,7 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 import torch
+from transformer_lens import HookedTransformer
 
 
 def load_dataset():
@@ -224,6 +226,102 @@ def get_top_discriminative_words(classifier_result, top_k=20):
         "top_positive": top_pos_words,
         "top_negative": top_neg_words,
     }
+
+
+VERIFICATION_DIR = Path(__file__).parent / "outputs" / "verification"
+
+
+def load_model(model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None):
+    """Load a HookedTransformer for trajectory generation."""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = HookedTransformer.from_pretrained(model_name, device=device)
+    model.eval()
+    return model
+
+
+def format_chat_prompt(model, user_message):
+    """Apply the model's chat template to a single user turn, ready for generation."""
+    messages = [{"role": "user", "content": user_message}]
+    return model.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+
+def run_trajectory(model, prompt_text, max_new_tokens=512, seed=None, **generate_kwargs):
+    """Generate one completion for a single prompt.
+
+    Args:
+        model: a loaded HookedTransformer
+        prompt_text: raw task prompt (chat template is applied internally)
+        max_new_tokens: generation budget
+        seed: torch RNG seed for reproducible sampling; None leaves RNG state as-is
+        **generate_kwargs: forwarded to HookedTransformer.generate (e.g. temperature, do_sample)
+
+    Returns:
+        dict record with prompt, formatted prompt, completion, and metadata
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    formatted_prompt = format_chat_prompt(model, prompt_text)
+    with torch.no_grad():
+        full_text = model.generate(
+            formatted_prompt,
+            max_new_tokens=max_new_tokens,
+            return_type="str",
+            verbose=False,
+            **generate_kwargs,
+        )
+    completion = full_text[len(formatted_prompt):]
+
+    return {
+        "prompt": prompt_text,
+        "formatted_prompt": formatted_prompt,
+        "completion": completion,
+        "model_name": model.cfg.model_name,
+        "max_new_tokens": max_new_tokens,
+        "seed": seed,
+        "generate_kwargs": generate_kwargs,
+    }
+
+
+def save_trajectory(record, label, task, pair_index, replicate_index, out_dir=VERIFICATION_DIR):
+    """Write one trajectory record to a JSON file for manual inspection.
+
+    Filename encodes category so files sort/group by (task, label, pair, replicate).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{task}_{label}_pair{pair_index:02d}_rep{replicate_index:02d}.json"
+    record_to_write = dict(record)
+    record_to_write.update({
+        "label": label,
+        "task": task,
+        "pair_index": pair_index,
+        "replicate_index": replicate_index,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    path = out_dir / filename
+    with open(path, "w") as f:
+        json.dump(record_to_write, f, indent=2)
+
+    return path
+
+
+def load_trajectories(out_dir=VERIFICATION_DIR):
+    """Load all saved trajectory records from out_dir, sorted by filename."""
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return []
+
+    records = []
+    for path in sorted(out_dir.glob("*.json")):
+        with open(path) as f:
+            records.append(json.load(f))
+    return records
 
 
 def compare_word_frequencies():

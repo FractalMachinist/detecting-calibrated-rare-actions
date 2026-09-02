@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Model trajectory outputs (for manual inspection, not for version control)
+/outputs/
