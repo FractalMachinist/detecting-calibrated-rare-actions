@@ -286,15 +286,53 @@ def run_trajectory(model, prompt_text, max_new_tokens=512, seed=None, **generate
     }
 
 
+def run_trajectory_with_activations(model, prompt_text, max_new_tokens=512, seed=None, **generate_kwargs):
+    """Generate one completion, then extract per-layer mean activations over its generated tokens.
+
+    Generation itself is unchanged from run_trajectory (HookedTransformer.generate does not
+    expose a cache). To get activations, the full (prompt + completion) token sequence is
+    re-run once through the model with run_with_cache, and each layer's resid_post is mean-pooled
+    over only the completion-token positions - the prompt is identical in shape/content between
+    positive/negative twins by construction, so it shouldn't carry the signal we're probing for.
+
+    Returns:
+        dict with everything run_trajectory returns, plus "activations": a
+        [n_layers, d_model] float tensor (mean resid_post per layer over completion tokens).
+    """
+    record = run_trajectory(model, prompt_text, max_new_tokens=max_new_tokens, seed=seed, **generate_kwargs)
+
+    prompt_tokens = model.to_tokens(record["formatted_prompt"])
+    full_tokens = model.to_tokens(record["formatted_prompt"] + record["completion"])
+    n_prompt_tokens = prompt_tokens.shape[1]
+
+    with torch.no_grad():
+        _, cache = model.run_with_cache(
+            full_tokens,
+            names_filter=lambda name: name.endswith("hook_resid_post"),
+        )
+
+    n_layers = model.cfg.n_layers
+    per_layer_means = []
+    for layer in range(n_layers):
+        resid = cache["resid_post", layer][0]  # [pos, d_model]
+        completion_resid = resid[n_prompt_tokens:]  # generated tokens only
+        per_layer_means.append(completion_resid.mean(dim=0))
+
+    record["activations"] = torch.stack(per_layer_means, dim=0).cpu()  # [n_layers, d_model]
+    return record
+
+
 def save_trajectory(record, label, task, pair_index, replicate_index, out_dir=VERIFICATION_DIR):
     """Write one trajectory record to a JSON file for manual inspection.
 
     Filename encodes category so files sort/group by (task, label, pair, replicate).
+    If record contains an "activations" tensor (see run_trajectory_with_activations), it is
+    written to a sibling .pt file instead of into the JSON, which is left holding only the path.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"{task}_{label}_pair{pair_index:02d}_rep{replicate_index:02d}.json"
+    filename = f"{task}_{label}_pair{pair_index:02d}_rep{replicate_index:02d}"
     record_to_write = dict(record)
     record_to_write.update({
         "label": label,
@@ -304,15 +342,25 @@ def save_trajectory(record, label, task, pair_index, replicate_index, out_dir=VE
         "saved_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    path = out_dir / filename
+    activations = record_to_write.pop("activations", None)
+    if activations is not None:
+        activations_path = out_dir / f"{filename}.pt"
+        torch.save(activations, activations_path)
+        record_to_write["activations_path"] = str(activations_path.name)
+
+    path = out_dir / f"{filename}.json"
     with open(path, "w") as f:
         json.dump(record_to_write, f, indent=2)
 
     return path
 
 
-def load_trajectories(out_dir=VERIFICATION_DIR):
-    """Load all saved trajectory records from out_dir, sorted by filename."""
+def load_trajectories(out_dir=VERIFICATION_DIR, load_activations=False):
+    """Load all saved trajectory records from out_dir, sorted by filename.
+
+    If load_activations is True, each record's "activations_path" (if present) is resolved
+    relative to out_dir and loaded back into an "activations" tensor.
+    """
     out_dir = Path(out_dir)
     if not out_dir.exists():
         return []
@@ -320,7 +368,10 @@ def load_trajectories(out_dir=VERIFICATION_DIR):
     records = []
     for path in sorted(out_dir.glob("*.json")):
         with open(path) as f:
-            records.append(json.load(f))
+            record = json.load(f)
+        if load_activations and "activations_path" in record:
+            record["activations"] = torch.load(out_dir / record["activations_path"])
+        records.append(record)
     return records
 
 
@@ -359,3 +410,133 @@ def compare_word_frequencies():
         "pos_counter": dict(pos_words),
         "neg_counter": dict(neg_words),
     }
+
+
+PROBE_DIR = Path(__file__).parent / "probes"
+
+
+def fit_diff_of_means_direction(pos_acts, neg_acts):
+    """Fit a difference-of-means probe direction, independently per layer.
+
+    Args:
+        pos_acts: [n_pos, n_layers, d_model] tensor of positive-class activations
+        neg_acts: [n_neg, n_layers, d_model] tensor of negative-class activations
+
+    Returns:
+        dict with "direction" ([n_layers, d_model], unit-normalized per layer) and
+        "bias" ([n_layers]): the projection of the pos/neg class-mean midpoint onto that
+        direction, so that score = acts @ direction - bias is positive for the positive class.
+    """
+    pos_mean = pos_acts.mean(dim=0)  # [n_layers, d_model]
+    neg_mean = neg_acts.mean(dim=0)  # [n_layers, d_model]
+
+    direction = pos_mean - neg_mean
+    direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    midpoint = (pos_mean + neg_mean) / 2  # [n_layers, d_model]
+    bias = (midpoint * direction).sum(dim=-1)  # [n_layers]
+
+    return {"direction": direction, "bias": bias}
+
+
+def project_onto_probe(acts, direction, bias):
+    """Score activations against a fitted per-layer direction.
+
+    Args:
+        acts: [n_examples, n_layers, d_model]
+        direction: [n_layers, d_model]
+        bias: [n_layers]
+
+    Returns:
+        [n_examples, n_layers] tensor of signed scores (positive class scores higher).
+    """
+    return torch.einsum("eld,ld->el", acts, direction) - bias
+
+
+def sweep_layers(pos_acts, neg_acts, pos_pair_ids, neg_pair_ids, fit_pair_ids, select_pair_ids):
+    """Fit a diff-of-means probe per layer on one set of pairs, evaluate AUROC on another.
+
+    Splitting by pair id (rather than by individual trajectory) keeps every replicate of a
+    given prompt pair on the same side of the split, since replicates of the same pair are
+    near-duplicates and would otherwise leak between fitting and selection.
+
+    Args:
+        pos_acts, neg_acts: [n, n_layers, d_model] activation tensors
+        pos_pair_ids, neg_pair_ids: pair index for each row of pos_acts / neg_acts
+        fit_pair_ids: pair indices used to fit the per-layer direction
+        select_pair_ids: held-out pair indices used to score AUROC per layer
+
+    Returns:
+        dict with "auroc_per_layer" ([n_layers]), "best_layer" (int), "best_auroc" (float),
+        and "fit" (the fit_diff_of_means_direction result trained on fit_pair_ids, at every layer).
+    """
+    fit_pair_ids = set(fit_pair_ids)
+    select_pair_ids = set(select_pair_ids)
+
+    pos_pair_ids = torch.as_tensor(pos_pair_ids)
+    neg_pair_ids = torch.as_tensor(neg_pair_ids)
+
+    fit_pos_mask = torch.tensor([int(p.item()) in fit_pair_ids for p in pos_pair_ids])
+    fit_neg_mask = torch.tensor([int(p.item()) in fit_pair_ids for p in neg_pair_ids])
+    sel_pos_mask = torch.tensor([int(p.item()) in select_pair_ids for p in pos_pair_ids])
+    sel_neg_mask = torch.tensor([int(p.item()) in select_pair_ids for p in neg_pair_ids])
+
+    fit = fit_diff_of_means_direction(pos_acts[fit_pos_mask], neg_acts[fit_neg_mask])
+
+    sel_pos_scores = project_onto_probe(pos_acts[sel_pos_mask], fit["direction"], fit["bias"])
+    sel_neg_scores = project_onto_probe(neg_acts[sel_neg_mask], fit["direction"], fit["bias"])
+
+    n_layers = fit["direction"].shape[0]
+    y_true = np.concatenate([
+        np.ones(sel_pos_scores.shape[0]),
+        np.zeros(sel_neg_scores.shape[0]),
+    ])
+
+    auroc_per_layer = []
+    for layer in range(n_layers):
+        y_score = np.concatenate([
+            sel_pos_scores[:, layer].numpy(),
+            sel_neg_scores[:, layer].numpy(),
+        ])
+        auroc_per_layer.append(float(roc_auc_score(y_true, y_score)))
+
+    best_layer = int(np.argmax(auroc_per_layer))
+
+    return {
+        "auroc_per_layer": auroc_per_layer,
+        "best_layer": best_layer,
+        "best_auroc": auroc_per_layer[best_layer],
+        "fit": fit,
+    }
+
+
+def save_probe(probe, model_name, layer, path=None):
+    """Save a fitted probe (single layer's direction + bias) to disk for version control.
+
+    Args:
+        probe: dict with "direction" ([d_model]) and "bias" (scalar) for the chosen layer
+        model_name: name of the model the probe was trained on, for metadata
+        layer: the chosen layer index, for metadata
+        path: output path; defaults to probes/diff_of_means_probe.pt
+    """
+    if path is None:
+        path = PROBE_DIR / "diff_of_means_probe.pt"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save({
+        "direction": probe["direction"],
+        "bias": probe["bias"],
+        "layer": layer,
+        "model_name": model_name,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }, path)
+
+    return path
+
+
+def load_probe(path=None):
+    """Load a probe saved by save_probe."""
+    if path is None:
+        path = PROBE_DIR / "diff_of_means_probe.pt"
+    return torch.load(Path(path), weights_only=False)
