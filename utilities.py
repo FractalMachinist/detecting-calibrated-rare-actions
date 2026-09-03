@@ -664,7 +664,7 @@ def sweep_layers(pos_acts, neg_acts, pos_pair_ids, neg_pair_ids, fit_pair_ids, s
     (though still swept and reported): the earliest layers mostly encode surface token
     identity, and the latest layers are closest to next-token-prediction logits, so a "best"
     layer picked from either end is more likely to reflect a lexical shortcut (e.g. the
-    "conditioned on" confound noted in the README) than the semantic step-3 reasoning this
+    "conditioned on" confound noted in METHODS.md) than the semantic step-3 reasoning this
     probe is meant to find. See validate-dataset.ipynb's BoW classifier confound analysis.
 
     Args:
