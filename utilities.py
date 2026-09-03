@@ -403,6 +403,57 @@ def add_activations_batch(model, records):
     return records
 
 
+def add_token_scores_batch(model, records, direction, bias, layer):
+    """Extract per-token probe scores at a single layer, for a batch of already-generated records.
+
+    Unlike add_activations_batch (which mean-pools each trajectory to one [n_layers, d_model]
+    vector, across every layer), this keeps per-token resolution but only at one layer - the
+    layer a probe was already fit on - and immediately projects each token's resid_post onto
+    that probe's direction, so what's kept per token is a single float (the probe's score)
+    rather than a [d_model] activation vector. That's what makes it cheap to run on every saved
+    trajectory: no per-token activation storage, just a score curve plus the token strings to
+    align it with the completion text.
+
+    Args:
+        model: a loaded HookedTransformer (see load_model)
+        records: list of record dicts from run_trajectory_batch, mutated in place
+        direction: [d_model] probe direction (e.g. "direction" from a saved probe)
+        bias: scalar probe bias (e.g. "bias" from a saved probe)
+        layer: which layer's resid_post to score (the layer the probe was fit/selected at)
+
+    Returns:
+        the same records list, each with "token_scores" added (list[float], one probe score per
+        generated token, in generation order) and "token_strs" (the matching decoded token strings).
+    """
+    full_texts = [r["formatted_prompt"] + r["completion"] for r in records]
+    full_tokens = model.to_tokens(full_texts, padding_side="left")
+
+    # Left-padding puts each row's real content flush against the right edge, so a row's
+    # completion always occupies the last n_completion_tokens positions - no per-row offsets needed.
+    completion_lengths = [
+        model.to_tokens(r["completion"], prepend_bos=False).shape[1] for r in records
+    ]
+
+    with torch.no_grad():
+        _, cache = model.run_with_cache(
+            full_tokens,
+            names_filter=lambda name: name == f"blocks.{layer}.hook_resid_post",
+        )
+    resid = cache["resid_post", layer]  # [batch, pos, d_model]
+    direction = direction.to(device=resid.device, dtype=resid.dtype)
+
+    total_positions = full_tokens.shape[1]
+    for i, record in enumerate(records):
+        n_completion = completion_lengths[i]
+        start = total_positions - n_completion  # -n_completion: breaks when n_completion == 0
+        completion_resid = resid[i, start:].float()  # [n_completion, d_model]
+        scores = completion_resid @ direction.float() - float(bias)
+        record["token_scores"] = scores.cpu().tolist()
+        record["token_strs"] = model.to_str_tokens(full_tokens[i, start:], prepend_bos=False)
+
+    return records
+
+
 def save_trajectory(record, label, task, pair_index, replicate_index, out_dir=VERIFICATION_DIR):
     """Write one trajectory record to a JSON file for manual inspection.
 
