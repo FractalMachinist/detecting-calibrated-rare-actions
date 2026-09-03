@@ -9,3 +9,4 @@ ipympl
 transformer_lens
 tqdm
 wandb
+dotenv

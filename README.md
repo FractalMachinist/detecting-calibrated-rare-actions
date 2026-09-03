@@ -7,6 +7,8 @@ Create a simple proof-of-concept probe which detects if the model is conditionin
 ## STATUS
 
 2026-09-01 10:30pm: Just completed step 2.1, acceptably passed the blind review with one confound ("conditioned on"). Expect next tasks are writing the experiment notebook to run length trend and BoW classifier, then move onto a rented instance to run the rest of the experiment.
+2026-09-02 11:40pm: Just finished step 3.3 which introduced substantial new confounds and essentially rewrote large parts of the dataset, avoiding models getting wildly off-topic.
+2026-09-03: Ran experiment.ipynb SIZE='full' on Qwen3-14B (steps 4-5). Fixed a bfloat16/numpy crash in activation caching, restricted layer selection to the middle 80% of layers (the smoke run had picked layer 0, a lexical-shortcut risk), and fixed the train/test pair split to interleave tasks proportionally (the positional 20/5 split had put 0 coding pairs in the test set, since dataset.json blocks coding before email). Held-out test AUROC: 0.9308 (STRONG), separated in both tasks and all 5 test pairs. Found and documented, but did not resolve, a truncation confound: positive-labeled completions hit the max_new_tokens budget substantially more often than negative ones, which the probe could partly be keying on — see the notebook's Conclusion for details. Probe saved to probes/diff_of_means_probe.pt (layer 28).
 
 NOTE: I expect I won't end up validating for generalization due to time constraints.
 

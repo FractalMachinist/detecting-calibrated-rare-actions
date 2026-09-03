@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 from collections import Counter
@@ -395,7 +396,9 @@ def add_activations_batch(model, records):
             resid = cache["resid_post", layer][i]  # [pos, d_model]
             completion_resid = resid[start:]  # generated tokens only, right-aligned
             per_layer_means.append(completion_resid.mean(dim=0))
-        record["activations"] = torch.stack(per_layer_means, dim=0).cpu()  # [n_layers, d_model]
+        # .float(): activations are read back into numpy downstream (sweep_layers, AUROC scoring),
+        # and numpy has no bfloat16 support - cast once here rather than at every consumer.
+        record["activations"] = torch.stack(per_layer_means, dim=0).float().cpu()  # [n_layers, d_model]
 
     return records
 
@@ -531,22 +534,32 @@ def project_onto_probe(acts, direction, bias):
     return torch.einsum("eld,ld->el", acts, direction) - bias
 
 
-def sweep_layers(pos_acts, neg_acts, pos_pair_ids, neg_pair_ids, fit_pair_ids, select_pair_ids):
+def sweep_layers(pos_acts, neg_acts, pos_pair_ids, neg_pair_ids, fit_pair_ids, select_pair_ids, edge_exclude_frac=0.1):
     """Fit a diff-of-means probe per layer on one set of pairs, evaluate AUROC on another.
 
     Splitting by pair id (rather than by individual trajectory) keeps every replicate of a
     given prompt pair on the same side of the split, since replicates of the same pair are
     near-duplicates and would otherwise leak between fitting and selection.
 
+    The first and last edge_exclude_frac of layers are excluded from best-layer selection
+    (though still swept and reported): the earliest layers mostly encode surface token
+    identity, and the latest layers are closest to next-token-prediction logits, so a "best"
+    layer picked from either end is more likely to reflect a lexical shortcut (e.g. the
+    "conditioned on" confound noted in the README) than the semantic step-3 reasoning this
+    probe is meant to find. See validate-dataset.ipynb's BoW classifier confound analysis.
+
     Args:
         pos_acts, neg_acts: [n, n_layers, d_model] activation tensors
         pos_pair_ids, neg_pair_ids: pair index for each row of pos_acts / neg_acts
         fit_pair_ids: pair indices used to fit the per-layer direction
         select_pair_ids: held-out pair indices used to score AUROC per layer
+        edge_exclude_frac: fraction of layers excluded from best-layer selection at each end
 
     Returns:
-        dict with "auroc_per_layer" ([n_layers]), "best_layer" (int), "best_auroc" (float),
-        and "fit" (the fit_diff_of_means_direction result trained on fit_pair_ids, at every layer).
+        dict with "auroc_per_layer" ([n_layers], every layer), "best_layer" (int, restricted
+        to the eligible middle range), "best_auroc" (float), "eligible_layers" (list[int]),
+        "excluded_layers" (list[int]), and "fit" (the fit_diff_of_means_direction result
+        trained on fit_pair_ids, at every layer).
     """
     fit_pair_ids = set(fit_pair_ids)
     select_pair_ids = set(select_pair_ids)
@@ -578,12 +591,22 @@ def sweep_layers(pos_acts, neg_acts, pos_pair_ids, neg_pair_ids, fit_pair_ids, s
         ])
         auroc_per_layer.append(float(roc_auc_score(y_true, y_score)))
 
-    best_layer = int(np.argmax(auroc_per_layer))
+    n_exclude = math.ceil(n_layers * edge_exclude_frac)
+    eligible_layers = list(range(n_exclude, n_layers - n_exclude))
+    if not eligible_layers:
+        raise ValueError(
+            f"edge_exclude_frac={edge_exclude_frac} excludes all {n_layers} layers; lower it"
+        )
+    excluded_layers = [l for l in range(n_layers) if l not in eligible_layers]
+
+    best_layer = max(eligible_layers, key=lambda l: auroc_per_layer[l])
 
     return {
         "auroc_per_layer": auroc_per_layer,
         "best_layer": best_layer,
         "best_auroc": auroc_per_layer[best_layer],
+        "eligible_layers": eligible_layers,
+        "excluded_layers": excluded_layers,
         "fit": fit,
     }
 
