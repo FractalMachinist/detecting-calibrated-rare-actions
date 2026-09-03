@@ -1,7 +1,11 @@
 torch
 numpy
+scipy
 scikit-learn
 matplotlib
 jupyter
 ipywidgets
 ipympl
+transformer_lens
+tqdm
+wandb

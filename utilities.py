@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from collections import Counter
 from datetime import datetime, timezone
@@ -10,6 +11,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 import torch
 from transformer_lens import HookedTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from dotenv import load_dotenv
+
+load_dotenv()
+os.environ.setdefault("HF_TOKEN", os.getenv("HF_TOKEN", ""))
 
 
 def load_dataset():
@@ -231,79 +237,147 @@ def get_top_discriminative_words(classifier_result, top_k=20):
 VERIFICATION_DIR = Path(__file__).parent / "outputs" / "verification"
 
 
-def load_model(model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None):
-    """Load a HookedTransformer for trajectory generation."""
+def load_model(model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None, dtype=torch.bfloat16):
+    """Load a HookedTransformer for trajectory generation.
+
+    dtype defaults to bfloat16: loading in float32 (HookedTransformer's default)
+    roughly doubles compute/memory over the model's native precision for no accuracy
+    benefit on these architectures.
+
+    Uses from_pretrained_no_processing rather than from_pretrained: the latter's
+    weight processing (LayerNorm-folding, weight centering) is only exact in high
+    precision, and we read raw resid_post activations downstream for the probe, so
+    processing error in bf16 would leak into the values the probe is trained on.
+    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = HookedTransformer.from_pretrained(model_name, device=device)
+    model = HookedTransformer.from_pretrained_no_processing(model_name, device=device, dtype=dtype)
     model.eval()
     return model
 
 
-def format_chat_prompt(model, user_message):
-    """Apply the model's chat template to a single user turn, ready for generation."""
+def load_hf_model(model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None, dtype=torch.bfloat16):
+    """Load a plain HuggingFace causal LM + tokenizer for fast trajectory generation.
+
+    TransformerLens's HookedTransformer.generate carries substantial per-step overhead
+    versus native HF generate (it's built for hookable/cacheable activations, not
+    decoding throughput), so trajectory generation uses this HF path instead; activations
+    are extracted separately (see add_activations_batch) via a HookedTransformer loaded
+    from load_model.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(device)
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    return model, tokenizer
+
+
+def format_chat_prompt(tokenizer, user_message):
+    """Apply the tokenizer's chat template to a single user turn, ready for generation."""
     messages = [{"role": "user", "content": user_message}]
-    return model.tokenizer.apply_chat_template(
+    return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
 
 
-def run_trajectory(model, prompt_text, max_new_tokens=512, seed=None, **generate_kwargs):
-    """Generate one completion for a single prompt.
+def run_trajectory(hf_model, tokenizer, prompt_text, max_new_tokens=512, seed=None, **generate_kwargs):
+    """Generate one completion for a single prompt. Thin wrapper around run_trajectory_batch."""
+    return run_trajectory_batch(
+        hf_model, tokenizer, prompt_text, n_replicates=1, max_new_tokens=max_new_tokens, seed=seed, **generate_kwargs
+    )[0]
+
+
+def run_trajectory_batch(hf_model, tokenizer, prompt_text, n_replicates, max_new_tokens=1024, seed=None, **generate_kwargs):
+    """Generate n_replicates completions for the same prompt in a single batched forward pass.
+
+    Uses a plain HuggingFace model (see load_hf_model), not a HookedTransformer: TransformerLens's
+    generate has much higher per-step overhead than native HF generate, and generation itself needs
+    no hooks or activation access (see add_activations_batch for that, run separately on the
+    finished text via a HookedTransformer).
+
+    All replicates share one prompt, so they're batched into one .generate call instead of
+    n_replicates separate ones. seed (if given) is set once before the batched call: with sampling
+    on, each row in the batch still draws independently from the shared RNG stream, so replicates
+    differ from each other, but the batch as a whole is reproducible from seed (not each row
+    individually - there's no single-row seed once generation is batched).
 
     Args:
-        model: a loaded HookedTransformer
-        prompt_text: raw task prompt (chat template is applied internally)
+        hf_model: a loaded HuggingFace causal LM (see load_hf_model)
+        tokenizer: the matching HuggingFace tokenizer
+        prompt_text: raw task prompt (chat template is applied internally), shared by all replicates
+        n_replicates: number of completions to generate for this prompt
         max_new_tokens: generation budget
-        seed: torch RNG seed for reproducible sampling; None leaves RNG state as-is
-        **generate_kwargs: forwarded to HookedTransformer.generate (e.g. temperature, do_sample)
+        seed: torch RNG seed for the whole batch; None leaves RNG state as-is
+        **generate_kwargs: forwarded to model.generate (e.g. temperature; do_sample is implied by temperature)
 
     Returns:
-        dict record with prompt, formatted prompt, completion, and metadata
+        list of n_replicates record dicts: prompt, formatted prompt, completion, and metadata
     """
     if seed is not None:
         torch.manual_seed(seed)
 
-    formatted_prompt = format_chat_prompt(model, prompt_text)
+    formatted_prompt = format_chat_prompt(tokenizer, prompt_text)
+    inputs = tokenizer([formatted_prompt] * n_replicates, return_tensors="pt").to(hf_model.device)
+    n_prompt_tokens = inputs["input_ids"].shape[1]
+
     with torch.no_grad():
-        full_text = model.generate(
-            formatted_prompt,
+        output_tokens = hf_model.generate(
+            **inputs,
             max_new_tokens=max_new_tokens,
-            return_type="str",
-            verbose=False,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             **generate_kwargs,
         )
-    completion = full_text[len(formatted_prompt):]
 
-    return {
-        "prompt": prompt_text,
-        "formatted_prompt": formatted_prompt,
-        "completion": completion,
-        "model_name": model.cfg.model_name,
-        "max_new_tokens": max_new_tokens,
-        "seed": seed,
-        "generate_kwargs": generate_kwargs,
-    }
+    records = []
+    for row in output_tokens:
+        new_tokens = row[n_prompt_tokens:]
+        completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        records.append({
+            "prompt": prompt_text,
+            "formatted_prompt": formatted_prompt,
+            "completion": completion,
+            "model_name": hf_model.config._name_or_path,
+            "max_new_tokens": max_new_tokens,
+            "seed": seed,
+            "generate_kwargs": generate_kwargs,
+        })
+    return records
 
 
-def run_trajectory_with_activations(model, prompt_text, max_new_tokens=512, seed=None, **generate_kwargs):
-    """Generate one completion, then extract per-layer mean activations over its generated tokens.
+def add_activations_batch(model, records):
+    """Extract per-layer mean activations for a batch of already-generated trajectory records.
 
-    Generation itself is unchanged from run_trajectory (HookedTransformer.generate does not
-    expose a cache). To get activations, the full (prompt + completion) token sequence is
-    re-run once through the model with run_with_cache, and each layer's resid_post is mean-pooled
-    over only the completion-token positions - the prompt is identical in shape/content between
-    positive/negative twins by construction, so it shouldn't carry the signal we're probing for.
+    Takes records from run_trajectory_batch (prompt already generated) and a separately-loaded
+    HookedTransformer (see load_model). Each record's full (prompt + completion) token sequence is
+    re-tokenized and the whole batch is run once through the model with run_with_cache (one forward
+    pass for all records, left-padded since records can have different completion lengths), and each
+    layer's resid_post is mean-pooled over only that row's completion-token positions - the prompt is
+    identical in shape/content between positive/negative twins by construction, so it shouldn't carry
+    the signal we're probing for.
+
+    This is deliberately a separate model/pass from generation (run_trajectory_batch): generation
+    uses a plain HF model for speed, while this uses a HookedTransformer for cache access. Load
+    HF and HookedTransformer models sequentially, not concurrently, when working with large models -
+    two full copies of a large model may not both fit in GPU memory at once.
+
+    Args:
+        model: a loaded HookedTransformer (see load_model)
+        records: list of record dicts from run_trajectory_batch, mutated in place
 
     Returns:
-        dict with everything run_trajectory returns, plus "activations": a
-        [n_layers, d_model] float tensor (mean resid_post per layer over completion tokens).
+        the same records list, each with "activations" added: a [n_layers, d_model] float tensor
+        (mean resid_post per layer over completion tokens).
     """
-    record = run_trajectory(model, prompt_text, max_new_tokens=max_new_tokens, seed=seed, **generate_kwargs)
+    full_texts = [r["formatted_prompt"] + r["completion"] for r in records]
+    full_tokens = model.to_tokens(full_texts, padding_side="left")
 
-    prompt_tokens = model.to_tokens(record["formatted_prompt"])
-    full_tokens = model.to_tokens(record["formatted_prompt"] + record["completion"])
-    n_prompt_tokens = prompt_tokens.shape[1]
+    # Left-padding puts each row's real content flush against the right edge, so a row's
+    # completion always occupies the last n_completion_tokens positions - no per-row offsets needed.
+    completion_lengths = [
+        model.to_tokens(r["completion"], prepend_bos=False).shape[1] for r in records
+    ]
 
     with torch.no_grad():
         _, cache = model.run_with_cache(
@@ -312,21 +386,25 @@ def run_trajectory_with_activations(model, prompt_text, max_new_tokens=512, seed
         )
 
     n_layers = model.cfg.n_layers
-    per_layer_means = []
-    for layer in range(n_layers):
-        resid = cache["resid_post", layer][0]  # [pos, d_model]
-        completion_resid = resid[n_prompt_tokens:]  # generated tokens only
-        per_layer_means.append(completion_resid.mean(dim=0))
+    total_positions = full_tokens.shape[1]
+    for i, record in enumerate(records):
+        n_completion = completion_lengths[i]
+        start = total_positions - n_completion  # -n_completion: breaks when n_completion == 0
+        per_layer_means = []
+        for layer in range(n_layers):
+            resid = cache["resid_post", layer][i]  # [pos, d_model]
+            completion_resid = resid[start:]  # generated tokens only, right-aligned
+            per_layer_means.append(completion_resid.mean(dim=0))
+        record["activations"] = torch.stack(per_layer_means, dim=0).cpu()  # [n_layers, d_model]
 
-    record["activations"] = torch.stack(per_layer_means, dim=0).cpu()  # [n_layers, d_model]
-    return record
+    return records
 
 
 def save_trajectory(record, label, task, pair_index, replicate_index, out_dir=VERIFICATION_DIR):
     """Write one trajectory record to a JSON file for manual inspection.
 
     Filename encodes category so files sort/group by (task, label, pair, replicate).
-    If record contains an "activations" tensor (see run_trajectory_with_activations), it is
+    If record contains an "activations" tensor (see add_activations_batch), it is
     written to a sibling .pt file instead of into the JSON, which is left holding only the path.
     """
     out_dir = Path(out_dir)
