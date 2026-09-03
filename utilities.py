@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -450,6 +451,63 @@ def add_token_scores_batch(model, records, direction, bias, layer):
         scores = completion_resid @ direction.float() - float(bias)
         record["token_scores"] = scores.cpu().tolist()
         record["token_strs"] = model.to_str_tokens(full_tokens[i, start:], prepend_bos=False)
+
+
+TOKEN_SCORE_DIR = Path(__file__).parent / "outputs" / "token_scores"
+
+
+def _probe_fingerprint(direction, bias, layer, model_name):
+    """Identity of a probe, for cache invalidation - not just the layer/model, but the exact
+    direction/bias values, so a retrained probe at the same layer can't silently reuse stale scores.
+    """
+    direction_hash = hashlib.sha256(
+        direction.detach().cpu().numpy().astype(np.float32).tobytes()
+    ).hexdigest()
+    return {
+        "model_name": model_name,
+        "layer": int(layer),
+        "direction_hash": direction_hash,
+        "bias": float(bias),
+    }
+
+
+def _token_score_cache_path(record, cache_dir):
+    filename = f"{record['task']}_{record['label']}_pair{record['pair_index']:02d}_rep{record['replicate_index']:02d}.json"
+    return Path(cache_dir) / filename
+
+
+def load_cached_token_scores(record, direction, bias, layer, model_name, cache_dir=TOKEN_SCORE_DIR):
+    """Return a cached (token_scores, token_strs) pair for this record and probe, or None.
+
+    None means either nothing is cached yet, or what's cached was computed with a different probe
+    (different model, layer, direction, or bias) - the caller should compute and then save_token_scores.
+    """
+    path = _token_score_cache_path(record, cache_dir)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        cached = json.load(f)
+    if cached.get("probe") != _probe_fingerprint(direction, bias, layer, model_name):
+        return None
+    return cached["token_scores"], cached["token_strs"]
+
+
+def save_token_scores(record, direction, bias, layer, model_name, cache_dir=TOKEN_SCORE_DIR):
+    """Write record["token_scores"]/["token_strs"] (see add_token_scores_batch) to the cache,
+    tagged with the probe identity that produced them, so a later load_cached_token_scores call
+    can tell whether they're still valid for the probe currently in use.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "probe": _probe_fingerprint(direction, bias, layer, model_name),
+        "token_scores": record["token_scores"],
+        "token_strs": record["token_strs"],
+    }
+    path = _token_score_cache_path(record, cache_dir)
+    with open(path, "w") as f:
+        json.dump(payload, f)
+    return path
 
     return records
 
