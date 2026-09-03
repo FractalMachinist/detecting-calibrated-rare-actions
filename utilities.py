@@ -348,16 +348,15 @@ def run_trajectory_batch(hf_model, tokenizer, prompt_text, n_replicates, max_new
     return records
 
 
-def add_activations_batch(model, records):
+def add_activations_batch(model, records, max_batch_size=4):
     """Extract per-layer mean activations for a batch of already-generated trajectory records.
 
     Takes records from run_trajectory_batch (prompt already generated) and a separately-loaded
     HookedTransformer (see load_model). Each record's full (prompt + completion) token sequence is
-    re-tokenized and the whole batch is run once through the model with run_with_cache (one forward
-    pass for all records, left-padded since records can have different completion lengths), and each
-    layer's resid_post is mean-pooled over only that row's completion-token positions - the prompt is
-    identical in shape/content between positive/negative twins by construction, so it shouldn't carry
-    the signal we're probing for.
+    re-tokenized and run through the model with run_with_cache (left-padded since records can have
+    different completion lengths), and each layer's resid_post is mean-pooled over only that row's
+    completion-token positions - the prompt is identical in shape/content between positive/negative
+    twins by construction, so it shouldn't carry the signal we're probing for.
 
     This is deliberately a separate model/pass from generation (run_trajectory_batch): generation
     uses a plain HF model for speed, while this uses a HookedTransformer for cache access. Load
@@ -367,39 +366,50 @@ def add_activations_batch(model, records):
     Args:
         model: a loaded HookedTransformer (see load_model)
         records: list of record dicts from run_trajectory_batch, mutated in place
+        max_batch_size: records are processed in sub-batches of at most this many at a time.
+            run_with_cache holds every layer's resid_post for every position in the batch at once,
+            so peak memory scales with batch_size * seq_len * n_layers * d_model - chunking here
+            trades a bit of speed (more, smaller forward passes) for a fixed memory ceiling that
+            doesn't depend on how many records the caller happens to group together.
 
     Returns:
         the same records list, each with "activations" added: a [n_layers, d_model] float tensor
         (mean resid_post per layer over completion tokens).
     """
-    full_texts = [r["formatted_prompt"] + r["completion"] for r in records]
-    full_tokens = model.to_tokens(full_texts, padding_side="left")
-
-    # Left-padding puts each row's real content flush against the right edge, so a row's
-    # completion always occupies the last n_completion_tokens positions - no per-row offsets needed.
-    completion_lengths = [
-        model.to_tokens(r["completion"], prepend_bos=False).shape[1] for r in records
-    ]
-
-    with torch.no_grad():
-        _, cache = model.run_with_cache(
-            full_tokens,
-            names_filter=lambda name: name.endswith("hook_resid_post"),
-        )
-
     n_layers = model.cfg.n_layers
-    total_positions = full_tokens.shape[1]
-    for i, record in enumerate(records):
-        n_completion = completion_lengths[i]
-        start = total_positions - n_completion  # -n_completion: breaks when n_completion == 0
-        per_layer_means = []
-        for layer in range(n_layers):
-            resid = cache["resid_post", layer][i]  # [pos, d_model]
-            completion_resid = resid[start:]  # generated tokens only, right-aligned
-            per_layer_means.append(completion_resid.mean(dim=0))
-        # .float(): activations are read back into numpy downstream (sweep_layers, AUROC scoring),
-        # and numpy has no bfloat16 support - cast once here rather than at every consumer.
-        record["activations"] = torch.stack(per_layer_means, dim=0).float().cpu()  # [n_layers, d_model]
+    for chunk_start in range(0, len(records), max_batch_size):
+        chunk = records[chunk_start : chunk_start + max_batch_size]
+
+        full_texts = [r["formatted_prompt"] + r["completion"] for r in chunk]
+        full_tokens = model.to_tokens(full_texts, padding_side="left")
+
+        # Left-padding puts each row's real content flush against the right edge, so a row's
+        # completion always occupies the last n_completion_tokens positions - no per-row offsets needed.
+        completion_lengths = [
+            model.to_tokens(r["completion"], prepend_bos=False).shape[1] for r in chunk
+        ]
+
+        with torch.no_grad():
+            _, cache = model.run_with_cache(
+                full_tokens,
+                names_filter=lambda name: name.endswith("hook_resid_post"),
+            )
+
+        total_positions = full_tokens.shape[1]
+        for i, record in enumerate(chunk):
+            n_completion = completion_lengths[i]
+            start = total_positions - n_completion  # -n_completion: breaks when n_completion == 0
+            per_layer_means = []
+            for layer in range(n_layers):
+                resid = cache["resid_post", layer][i]  # [pos, d_model]
+                completion_resid = resid[start:]  # generated tokens only, right-aligned
+                per_layer_means.append(completion_resid.mean(dim=0))
+            # .float(): activations are read back into numpy downstream (sweep_layers, AUROC scoring),
+            # and numpy has no bfloat16 support - cast once here rather than at every consumer.
+            record["activations"] = torch.stack(per_layer_means, dim=0).float().cpu()  # [n_layers, d_model]
+
+        del cache
+        torch.cuda.empty_cache()
 
     return records
 
