@@ -97,9 +97,9 @@ Not resolved either way - intentionally left as pointers into <code>outputs/trai
 </tr>
 
 <tr>
-<td><b>Verbalization dependence</b><br>Probe trained and tested only on trajectories that explicitly verbalize entropy-extraction reasoning in tagged output.</td>
+<td><b>Verbalization dependence</b><br>Probe trained and tested only on trajectories that explicitly verbalize entropy-extraction reasoning before the decision.</td>
 <td><ul>
-<li>By construction: every prompt in the dataset asks for an explicit `&lt;explanation&gt;`-style trace</li>
+<li>By construction: every prompt in the dataset asks the model to state its extracted value and comparison before deciding. The surface varies by pair - XML-style tags with names deliberately swapped per pair (<code>&lt;reasoning&gt;</code>, <code>&lt;explanation&gt;</code>, <code>&lt;derivation&gt;</code>, <code>&lt;rationale&gt;</code>, and others), or, in six of the coding pairs, a code comment stating the same thing with no tag at all - but the requirement to verbalize before deciding is universal.</li>
 </ul></td>
 <td><ul>
 <li>None tested. Whether the probe's direction reflects anything present without verbalization is entirely open - see Future Work</li>
